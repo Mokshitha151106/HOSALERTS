@@ -1,0 +1,117 @@
+/* Additional styles beyond what's in index.html */
+.top-header {
+    width: 100%;
+    background: rgba(255, 255, 255, 0.85);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    padding: 25px 0;
+    text-align: center;
+    box-shadow: 0 2px 15px rgba(0,0,0,0.08);
+}
+.logo-wrapper {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+}
+
+.top-logo {
+    width: 70px;
+    height: 70px;
+    object-fit: contain;
+    margin-bottom: 10px;
+}
+
+.app-title {
+    font-size: 28px;
+    font-weight: 700;
+    margin: 5px 0;
+    color: #333;
+}
+
+.app-subtitle {
+    font-size: 14px;
+    color: #777;
+    letter-spacing: 1px;
+}
+
+:root {
+    --primary: #667eea;
+    --secondary: #764ba2;
+    --success: #4ecdc4;
+    --danger: #ff6b6b;
+    --warning: #ffd166;
+    --dark: #333;
+    --light: #f8f9fa;
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    background: linear-gradient(135deg, var(--primary), var(--secondary));
+    min-height: 100vh;
+    margin: 0;
+}
+
+/* Animations */
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(20px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes slideIn {
+    from { transform: translateX(100%); }
+    to { transform: translateX(0); }
+}
+
+@keyframes pulse {
+    0% { transform: scale(1); }
+    50% { transform: scale(1.05); }
+    100% { transform: scale(1); }
+}
+
+/* Utility classes */
+.fade-in {
+    animation: fadeIn 0.5s ease;
+}
+
+.text-center {
+    text-align: center;
+}
+
+.mt-20 {
+    margin-top: 20px;
+}
+
+.mb-20 {
+    margin-bottom: 20px;
+}
+
+.hidden {
+    display: none !important;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: maroon;
+    border-radius: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--primary);
+    border-radius: 10px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: var(--secondary);
+}
