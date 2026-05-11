@@ -1,0 +1,296 @@
+// Socket connection
+const socket = io();
+
+// State management
+let state = {
+    currentPatientId: null,
+    currentView: 'nurse',
+    patients: [],
+    alerts: [],
+    medicines: []
+};
+
+// Initialize
+document.addEventListener('DOMContentLoaded', () => {
+    loadPatients();
+    loadStats();
+    loadAlerts();
+    setupSocketListeners();
+    
+    // Refresh data periodically
+    setInterval(loadStats, 30000);
+    setInterval(loadAlerts, 10000);
+});
+
+// Socket listeners
+function setupSocketListeners() {
+    socket.on('connect', () => {
+        console.log('Connected to server');
+        showNotification('Connected to server', 'success');
+    });
+
+    socket.on('new_alert', (alert) => {
+        addAlert(alert);
+        playAlertSound();
+        showNotification(`New alert: ${alert.message}`, 'warning');
+    });
+
+    socket.on('voice_alert', (data) => {
+        showVoiceAlert(data);
+    });
+
+    socket.on('voice_alert_escalation', (data) => {
+        showVoiceAlert(data, true);
+    });
+
+    socket.on('medicine_updated', (medicine) => {
+        if (medicine.patient_id === state.currentPatientId) {
+            loadMedicines(state.currentPatientId);
+        }
+    });
+
+    socket.on('medicine_added', (medicine) => {
+        if (medicine.patient_id === state.currentPatientId) {
+            loadMedicines(state.currentPatientId);
+            showNotification('New medicine added', 'success');
+        }
+    });
+
+    socket.on('alert_updated', () => {
+        loadAlerts();
+    });
+
+    socket.on('disconnect', () => {
+        console.log('Disconnected from server');
+        showNotification('Disconnected from server', 'error');
+    });
+}
+
+// API Calls
+async function loadPatients() {
+    try {
+        const response = await fetch('/api/patients');
+        state.patients = await response.json();
+        updatePatientSelect();
+    } catch (error) {
+        console.error('Error loading patients:', error);
+        showNotification('Error loading patients', 'error');
+    }
+}
+
+async function loadStats() {
+    try {
+        const response = await fetch('/api/stats');
+        const stats = await response.json();
+        updateStats(stats);
+    } catch (error) {
+        console.error('Error loading stats:', error);
+    }
+}
+
+async function loadAlerts() {
+    try {
+        const response = await fetch('/api/alerts');
+        state.alerts = await response.json();
+        displayAlerts();
+    } catch (error) {
+        console.error('Error loading alerts:', error);
+    }
+}
+
+async function loadMedicines(patientId) {
+    try {
+        const response = await fetch(`/api/patients/${patientId}/medicines`);
+        state.medicines = await response.json();
+        displayMedicines();
+    } catch (error) {
+        console.error('Error loading medicines:', error);
+    }
+}
+
+async function loadFamilyInfo(patientId) {
+    try {
+        const response = await fetch(`/api/patients/${patientId}/family`);
+        const family = await response.json();
+        displayFamilyInfo(family);
+    } catch (error) {
+        console.error('Error loading family info:', error);
+    }
+}
+
+async function updateMedicineStatus(medicineId, status) {
+    try {
+        const response = await fetch(`/api/medicines/${medicineId}/status`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                status: status,
+                nurse_name: 'Current Nurse'
+            })
+        });
+        
+        if (response.ok) {
+            if (state.currentPatientId) {
+                loadMedicines(state.currentPatientId);
+            }
+            loadAlerts();
+            showNotification(`Medicine marked as ${status}`, 'success');
+        }
+    } catch (error) {
+        console.error('Error updating medicine:', error);
+        showNotification('Error updating medicine', 'error');
+    }
+}
+
+async function acknowledgeAlert(alertId) {
+    try {
+        const response = await fetch(`/api/alerts/${alertId}/acknowledge`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ nurse_name: 'Current Nurse' })
+        });
+        
+        if (response.ok) {
+            loadAlerts();
+            closeVoiceAlert();
+            showNotification('Alert acknowledged', 'success');
+        }
+    } catch (error) {
+        console.error('Error acknowledging alert:', error);
+        showNotification('Error acknowledging alert', 'error');
+    }
+}
+
+// UI Updates
+function updatePatientSelect() {
+    const select = document.getElementById('patientSelect');
+    if (!select) return;
+    
+    select.innerHTML = '<option value="">Select a patient...</option>';
+    state.patients.forEach(patient => {
+        select.innerHTML += `<option value="${patient.id}">${patient.name} - Room ${patient.room_number}</option>`;
+    });
+}
+
+function updateStats(stats) {
+    document.getElementById('totalPatients').textContent = stats.total_patients;
+    document.getElementById('activeMedicines').textContent = stats.active_medicines;
+    document.getElementById('activeAlerts').textContent = stats.active_alerts;
+    document.getElementById('medsToday').textContent = stats.meds_today;
+}
+
+function displayAlerts() {
+    const alertList = document.getElementById('alertList');
+    if (!alertList) return;
+    
+    if (state.alerts.length === 0) {
+        alertList.innerHTML = '<p class="text-center" style="color: #666;">No active alerts</p>';
+        return;
+    }
+    
+    alertList.innerHTML = state.alerts.map(alert => `
+        <div class="alert-item ${alert.severity === 'critical' ? 'critical' : ''} fade-in">
+            <div class="alert-patient">${alert.patient_name || 'Unknown'} - Room ${alert.room_number || '---'}</div>
+            <div class="alert-message">${alert.message}</div>
+            <div class="alert-time">${alert.time_ago}</div>
+            <div class="alert-actions">
+                <button class="alert-btn primary" onclick="acknowledgeAlert(${alert.id})">Acknowledge</button>
+            </div>
+        </div>
+    `).join('');
+}
+
+function displayMedicines() {
+    const grid = document.getElementById('medicineGrid');
+    if (!grid) return;
+    
+    if (!state.medicines || state.medicines.length === 0) {
+        grid.innerHTML = '<p class="text-center" style="color: #666; grid-column: 1/-1;">No medications scheduled</p>';
+        return;
+    }
+    
+    grid.innerHTML = state.medicines.map(med => `
+        <div class="medicine-card fade-in">
+            <div class="medicine-name">${med.name}</div>
+            <div class="medicine-details">${med.dosage} - ${med.instructions}</div>
+            <div>
+                <span class="medicine-time">${formatTime(med.time)}</span>
+                <span class="medicine-status status-${med.status}">${med.status}</span>
+            </div>
+            ${state.currentView === 'nurse' && med.status === 'pending' ? `
+                <div class="nurse-actions">
+                    <button class="action-btn give" onclick="updateMedicineStatus(${med.id}, 'given')">✓ Mark Given</button>
+                    <button class="action-btn miss" onclick="updateMedicineStatus(${med.id}, 'missed')">✗ Mark Missed</button>
+                </div>
+            ` : ''}
+            ${med.last_given_time ? `
+                <div style="font-size: 12px; color: #666; margin-top: 10px;">
+                    Given by ${med.last_given_by} at ${med.last_given_time}
+                </div>
+            ` : ''}
+        </div>
+    `).join('');
+}
+
+function displayFamilyInfo(family) {
+    const familyInfo = document.getElementById('familyInfo');
+    if (!familyInfo) return;
+    
+    if (family && family.length > 0) {
+        const member = family[0];
+        familyInfo.innerHTML = `
+            <div class="contact-item"><strong>${member.name}</strong> (${member.relation})</div>
+            <div class="contact-item">📞 ${member.phone}</div>
+            <div class="contact-item">📧 ${member.email}</div>
+        `;
+    }
+}
+
+// Helper Functions
+function formatTime(time) {
+    if (!time) return '';
+    const [hours, minutes] = time.split(':');
+    const hour = parseInt(hours);
+    const ampm = hour >= 12 ? 'PM' : 'AM';
+    const hour12 = hour % 12 || 12;
+    return `${hour12}:${minutes} ${ampm}`;
+}
+
+function playAlertSound() {
+    const audio = new Audio('data:audio/wav;base64,UklGRlwAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YVAAAAA8');
+    audio.play().catch(e => console.log('Audio play failed:', e));
+}
+
+function showVoiceAlert(data, isEscalation = false) {
+    const voiceAlert = document.getElementById('voiceAlert');
+    const title = document.getElementById('voiceTitle');
+    const message = document.getElementById('voiceMessage');
+    
+    if (!voiceAlert || !title || !message) return;
+    
+    title.textContent = isEscalation ? '🚨 URGENT ALERT' : '🔊 Medication Alert';
+    message.textContent = isEscalation ? 
+        `${data.patient_name} in room ${data.room_number} - ${data.medicine_name} overdue by ${data.minutes_overdue} minutes!` :
+        `${data.patient_name} in room ${data.room_number} - ${data.message}`;
+    
+    voiceAlert.className = `voice-alert ${isEscalation ? 'escalation' : ''} active`;
+    
+    setTimeout(() => {
+        voiceAlert.classList.remove('active');
+    }, 10000);
+}
+
+function closeVoiceAlert() {
+    const voiceAlert = document.getElementById('voiceAlert');
+    if (voiceAlert) {
+        voiceAlert.classList.remove('active');
+    }
+}
+
+function showNotification(message, type = 'info') {
+    // Simple alert for now - can be enhanced with toast notifications
+    console.log(`[${type}] ${message}`);
+}
+
+// Export functions for global use
+window.loadPatients = loadPatients;
