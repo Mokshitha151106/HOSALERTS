@@ -1,556 +1,529 @@
-from flask import Flask, render_template, request, jsonify, session, send_from_directory
-from flask_socketio import SocketIO, emit
+from flask import Flask, request, jsonify, session, render_template_string
 from flask_sqlalchemy import SQLAlchemy
-from datetime import datetime, timedelta
+from datetime import datetime
 import os
-import threading
-import time
-import socket
-import json
-
-# Import local modules
-from database import db, Patient, VitalSign, Medicine, FamilyMember, Alert, NurseChecklist, User, user_patient, init_db
-from voice_alert import VoiceAlertSystem
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'hosalerts-secret-key-2024'
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///hosalerts.db'
+app.config['SECRET_KEY'] = 'hosalert-secret-key-2024'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///hosalert.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-db.init_app(app)
-socketio = SocketIO(app, cors_allowed_origins="*")
+db = SQLAlchemy(app)
 
-# Initialize voice alert system
-voice_system = VoiceAlertSystem()
+# ==================== DATABASE MODELS ====================
 
-# Voice Alert Manager for socket communication
-class VoiceAlertManager:
-    def __init__(self):
-        self.voice_system = voice_system
-        self.active_alerts = {}
-        self.offline_alerts = []
-    
-    def trigger_alert(self, patient_name, medicine_name, room_number, message):
-        alert_data = {
-            'patient_name': patient_name,
-            'medicine_name': medicine_name,
-            'room_number': room_number,
-            'message': message,
-            'timestamp': datetime.now().strftime('%H:%M:%S'),
-            'type': 'alert'
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    password = db.Column(db.String(120), nullable=False)
+    role = db.Column(db.String(50), nullable=False)
+    name = db.Column(db.String(100), nullable=False)
+
+class Patient(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    age = db.Column(db.Integer)
+    room_number = db.Column(db.String(20))
+    disease = db.Column(db.String(200))
+
+class Medicine(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    patient_id = db.Column(db.Integer, db.ForeignKey('patient.id'))
+    name = db.Column(db.String(100))
+    dosage = db.Column(db.String(50))
+    time = db.Column(db.String(10))
+    status = db.Column(db.String(20), default='pending')
+
+class Alert(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    patient_id = db.Column(db.Integer, db.ForeignKey('patient.id'))
+    medicine_id = db.Column(db.Integer, db.ForeignKey('medicine.id'))
+    message = db.Column(db.String(500))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    status = db.Column(db.String(20), default='active')
+
+# ==================== HTML TEMPLATE WITH VOICE ====================
+
+LOGIN_HTML = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>HOSALERT - Login</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            margin: 0;
+            padding: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
         }
-        # Play actual voice alert
-        self.voice_system.play_alert(
-            message,
-            patient_name,
-            medicine_name,
-            room_number
-        )
-        socketio.emit('voice_alert', alert_data)
-        return alert_data
-    
-    def trigger_escalation(self, patient_name, medicine_name, room_number, minutes_overdue):
-        alert_data = {
-            'patient_name': patient_name,
-            'medicine_name': medicine_name,
-            'room_number': room_number,
-            'minutes_overdue': minutes_overdue,
-            'type': 'escalation',
-            'timestamp': datetime.now().strftime('%H:%M:%S')
+        .login-container {
+            background: white;
+            padding: 40px;
+            border-radius: 10px;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.1);
+            width: 300px;
         }
-        # Play escalation voice alert
-        self.voice_system.play_escalation(
-            patient_name,
-            medicine_name,
-            datetime.now().strftime('%H:%M'),
-            minutes_overdue
-        )
-        socketio.emit('voice_alert_escalation', alert_data)
-        return alert_data
-    
-    def store_offline_alert(self, alert_data):
-        """Store alert for offline clients"""
-        self.offline_alerts.append({
-            **alert_data,
-            'stored_at': datetime.now().isoformat()
-        })
-        # Keep only last 100 alerts
-        if len(self.offline_alerts) > 100:
-            self.offline_alerts = self.offline_alerts[-100:]
-    
-    def get_offline_alerts(self, since_timestamp=None):
-        """Get offline alerts for syncing"""
-        if since_timestamp:
-            return [a for a in self.offline_alerts 
-                   if a.get('stored_at', '') > since_timestamp]
-        return self.offline_alerts
-    
-    def stop_alert(self):
-        self.voice_system.stop_alert()
-
-voice_manager = VoiceAlertManager()
-
-# Background alert checker
-def check_medication_alerts():
-    while True:
-        with app.app_context():
-            current_time = datetime.now().strftime('%H:%M')
-            
-            # Check for due medications
-            medicines = Medicine.query.filter_by(time=current_time, status='pending').all()
-            
-            for medicine in medicines:
-                patient = db.session.get(Patient, medicine.patient_id)
-                
-                if patient:
-                    # Check if alert already exists
-                    existing = Alert.query.filter_by(
-                        medicine_id=medicine.id,
-                        status='active'
-                    ).first()
-                    
-                    if not existing:
-                        # Create alert
-                        alert = Alert(
-                            patient_id=patient.id,
-                            medicine_id=medicine.id,
-                            message=f"Medication due: {medicine.name} {medicine.dosage} for {patient.name}",
-                            alert_type='medicine',
-                            severity='high'
-                        )
-                        db.session.add(alert)
-                        db.session.commit()
-                        
-                        # Trigger voice alert
-                        voice_data = voice_manager.trigger_alert(
-                            patient.name,
-                            f"{medicine.name} {medicine.dosage}",
-                            patient.room_number,
-                            f"Time for {medicine.name}"
-                        )
-                        
-                        # Store for offline clients
-                        voice_manager.store_offline_alert(voice_data)
-                        
-                        socketio.emit('new_alert', alert.to_dict())
-            
-            # Check for overdue medications (10+ minutes)
-            time_threshold = (datetime.now() - timedelta(minutes=10)).strftime('%H:%M')
-            overdue = Medicine.query.filter(
-                Medicine.time <= time_threshold,
-                Medicine.status == 'pending'
-            ).all()
-            
-            for medicine in overdue:
-                patient = db.session.get(Patient, medicine.patient_id)
-                
-                if patient:
-                    # Check if escalation already sent
-                    existing = Alert.query.filter_by(
-                        medicine_id=medicine.id,
-                        alert_type='escalation',
-                        status='active'
-                    ).first()
-                    
-                    if not existing:
-                        med_time = datetime.strptime(medicine.time, '%H:%M')
-                        current = datetime.now()
-                        minutes = (current.hour * 60 + current.minute) - (med_time.hour * 60 + med_time.minute)
-                        
-                        if minutes > 0:
-                            alert = Alert(
-                                patient_id=patient.id,
-                                medicine_id=medicine.id,
-                                message=f"URGENT: {medicine.name} overdue by {minutes} minutes for {patient.name}",
-                                alert_type='escalation',
-                                severity='critical'
-                            )
-                            db.session.add(alert)
-                            db.session.commit()
-                            
-                            voice_data = voice_manager.trigger_escalation(
-                                patient.name,
-                                f"{medicine.name} {medicine.dosage}",
-                                patient.room_number,
-                                minutes
-                            )
-                            
-                            voice_manager.store_offline_alert(voice_data)
-                            
-                            socketio.emit('new_alert', alert.to_dict())
+        h2 { text-align: center; color: #333; }
+        input {
+            width: 100%;
+            padding: 10px;
+            margin: 10px 0;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+        }
+        button {
+            width: 100%;
+            padding: 10px;
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        button:hover { background: #5a67d8; }
+        .error { color: red; text-align: center; margin-top: 10px; }
+        .voice-enabled {
+            position: fixed;
+            bottom: 10px;
+            right: 10px;
+            background: #28a745;
+            color: white;
+            padding: 5px 10px;
+            border-radius: 5px;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-container">
+        <h2>🏥 HOSALERT</h2>
+        <h3 style="text-align:center; color:#667eea;">Patient Medication Alert System</h3>
+        <input type="text" id="username" placeholder="Username" value="nurse">
+        <input type="password" id="password" placeholder="Password" value="nurse123">
+        <button onclick="login()">Login</button>
+        <div id="message"></div>
+        <p style="text-align: center; margin-top: 20px; font-size: 12px;">Demo: nurse / nurse123</p>
+    </div>
+    <div class="voice-enabled">🔊 Voice Alerts Ready</div>
+    <script>
+        function speak(message) {
+            if ('speechSynthesis' in window) {
+                const utterance = new SpeechSynthesisUtterance(message);
+                utterance.rate = 0.9;
+                utterance.pitch = 1;
+                window.speechSynthesis.cancel();
+                window.speechSynthesis.speak(utterance);
+            }
+        }
         
-        time.sleep(30)
+        function login() {
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+            
+            fetch('/api/login', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({username: username, password: password})
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.success) {
+                    speak('Welcome to HOSALERT. Login successful.');
+                    window.location.href = '/dashboard';
+                } else {
+                    document.getElementById('message').innerHTML = 
+                        '<div class="error">Invalid credentials</div>';
+                    speak('Login failed. Invalid credentials.');
+                }
+            });
+        }
+    </script>
+</body>
+</html>
+'''
 
-# Routes
+DASHBOARD_HTML = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>HOSALERT - Dashboard</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: #f4f4f4;
+        }
+        .header {
+            background: #667eea;
+            color: white;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .container {
+            display: flex;
+            gap: 20px;
+        }
+        .sidebar {
+            width: 280px;
+            background: white;
+            padding: 15px;
+            border-radius: 5px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        .main {
+            flex: 1;
+            background: white;
+            padding: 15px;
+            border-radius: 5px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        .patient-card {
+            background: #f9f9f9;
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+        .patient-card:hover { background: #e9e9e9; }
+        .selected-patient {
+            background: #667eea;
+            color: white;
+        }
+        .selected-patient:hover { background: #5a67d8; }
+        .alert {
+            background: #ff4757;
+            color: white;
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 5px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            animation: pulse 0.5s infinite alternate;
+        }
+        @keyframes pulse {
+            from { transform: scale(1); }
+            to { transform: scale(1.02); }
+        }
+        button {
+            background: #28a745;
+            color: white;
+            border: none;
+            padding: 8px 15px;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        button:hover { background: #218838; }
+        .medicine {
+            background: #f0f0f0;
+            padding: 10px;
+            margin: 8px 0;
+            border-radius: 5px;
+            display: flex;
+            justify-content: space-between;
+        }
+        h3 { margin: 0 0 15px 0; color: #333; }
+        .stats {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .stat-card {
+            background: #667eea;
+            color: white;
+            padding: 15px;
+            border-radius: 5px;
+            flex: 1;
+            text-align: center;
+        }
+        .logout {
+            color: white;
+            text-decoration: none;
+            background: rgba(255,255,255,0.2);
+            padding: 8px 15px;
+            border-radius: 5px;
+        }
+        .voice-control {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+        .voice-toggle {
+            background: #ff9800;
+            padding: 8px 15px;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        .voice-status {
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h2>🏥 HOSALERT - Patient Medication Alert System</h2>
+        <div class="voice-control">
+            <div class="voice-toggle" onclick="toggleVoice()">
+                🔊 Voice: <span id="voiceStatus">ON</span>
+            </div>
+            <a href="/logout" class="logout">Logout</a>
+        </div>
+    </div>
+    
+    <div class="stats" id="stats">
+        <div class="stat-card">👨‍⚕️ Patients: <span id="patientCount">0</span></div>
+        <div class="stat-card">💊 Medicines: <span id="medicineCount">0</span></div>
+        <div class="stat-card">🔔 Alerts: <span id="alertCount">0</span></div>
+    </div>
+    
+    <div class="container">
+        <div class="sidebar">
+            <h3>👨‍⚕️ Patients</h3>
+            <div id="patientsList"></div>
+        </div>
+        
+        <div class="main">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h3>🔔 Active Alerts</h3>
+                <div class="voice-status">🔊 New alerts will be spoken aloud</div>
+            </div>
+            <div id="alertsList"></div>
+            
+            <h3>💊 Medicines Schedule</h3>
+            <div id="medicinesList"></div>
+        </div>
+    </div>
+    
+    <script>
+        let currentPatientId = null;
+        let voiceEnabled = true;
+        let lastAlertIds = new Set();
+        
+        function speak(message) {
+            if (!voiceEnabled) return;
+            if ('speechSynthesis' in window) {
+                const utterance = new SpeechSynthesisUtterance(message);
+                utterance.rate = 0.9;
+                utterance.pitch = 1;
+                window.speechSynthesis.cancel();
+                window.speechSynthesis.speak(utterance);
+            }
+        }
+        
+        function toggleVoice() {
+            voiceEnabled = !voiceEnabled;
+            document.getElementById('voiceStatus').innerText = voiceEnabled ? 'ON' : 'OFF';
+            speak(voiceEnabled ? 'Voice alerts enabled' : 'Voice alerts disabled');
+        }
+        
+        function loadPatients() {
+            fetch('/api/patients')
+                .then(res => res.json())
+                .then(patients => {
+                    const container = document.getElementById('patientsList');
+                    document.getElementById('patientCount').innerText = patients.length;
+                    container.innerHTML = patients.map(p => `
+                        <div class="patient-card" onclick="selectPatient(${p.id})">
+                            <strong>${p.name}</strong><br>
+                            Room ${p.room_number} | Age ${p.age}
+                        </div>
+                    `).join('');
+                    if(patients.length > 0 && !currentPatientId) selectPatient(patients[0].id);
+                });
+        }
+        
+        function selectPatient(id) {
+            currentPatientId = id;
+            document.querySelectorAll('.patient-card').forEach(card => {
+                card.classList.remove('selected-patient');
+            });
+            event.target.closest('.patient-card').classList.add('selected-patient');
+            loadMedicines(id);
+            speak(`Selected patient ${id}`);
+        }
+        
+        function loadMedicines(patientId) {
+            fetch(`/api/medicines/${patientId}`)
+                .then(res => res.json())
+                .then(medicines => {
+                    const container = document.getElementById('medicinesList');
+                    document.getElementById('medicineCount').innerText = medicines.length;
+                    container.innerHTML = medicines.map(m => `
+                        <div class="medicine">
+                            <span><strong>${m.name}</strong> - ${m.dosage}</span>
+                            <span>⏰ ${m.time}</span>
+                            <span style="color: ${m.status === 'pending' ? 'orange' : 'green'}">
+                                ${m.status}
+                            </span>
+                        </div>
+                    `).join('');
+                });
+        }
+        
+        function loadAlerts() {
+            fetch('/api/alerts')
+                .then(res => res.json())
+                .then(alerts => {
+                    const container = document.getElementById('alertsList');
+                    document.getElementById('alertCount').innerText = alerts.length;
+                    
+                    // Check for new alerts and speak them
+                    alerts.forEach(alert => {
+                        if (!lastAlertIds.has(alert.id)) {
+                            lastAlertIds.add(alert.id);
+                            const alertMessage = `Alert for ${alert.patient_name}: ${alert.message}`;
+                            speak(alertMessage);
+                        }
+                    });
+                    
+                    container.innerHTML = alerts.map(a => `
+                        <div class="alert">
+                            <span>🔔 <strong>${a.patient_name}</strong>: ${a.message}</span>
+                            <button onclick="acknowledgeAlert(${a.id})">Acknowledge</button>
+                        </div>
+                    `).join('');
+                    
+                    // Keep only last 50 alert IDs
+                    if (lastAlertIds.size > 50) {
+                        const ids = Array.from(lastAlertIds);
+                        lastAlertIds = new Set(ids.slice(-50));
+                    }
+                });
+        }
+        
+        function acknowledgeAlert(alertId) {
+            fetch(`/api/alerts/${alertId}/acknowledge`, {method: 'POST'})
+                .then(() => {
+                    speak('Alert acknowledged');
+                    loadAlerts();
+                });
+        }
+        
+        // Auto-refresh every 10 seconds
+        setInterval(() => {
+            loadAlerts();
+            loadPatients();
+        }, 10000);
+        
+        // Speak welcome message
+        window.onload = () => {
+            speak('Welcome to HOSALERT dashboard. Monitoring patient medications.');
+            loadPatients();
+            loadAlerts();
+        };
+        
+        loadPatients();
+        loadAlerts();
+    </script>
+</body>
+</html>
+'''
+
+# ==================== ROUTES ====================
+
 @app.route('/')
 def index():
-    return render_template('index.html')
+    if 'user_id' in session:
+        return render_template_string(DASHBOARD_HTML)
+    return render_template_string(LOGIN_HTML)
 
-@app.route('/test')
-def test():
-    return "App is working!"
+@app.route('/dashboard')
+def dashboard():
+    if 'user_id' not in session:
+        return render_template_string(LOGIN_HTML)
+    return render_template_string(DASHBOARD_HTML)
 
-# Serve static files
-@app.route('/static/<path:filename>')
-def serve_static(filename):
-    return send_from_directory('static', filename)
-
-# ==================== NETWORK INFO ROUTE ====================
-@app.route('/api/network-info', methods=['GET'])
-def get_network_info():
-    """Get network information for sharing"""
-    try:
-        hostname = socket.gethostname()
-        local_ip = socket.gethostbyname(hostname)
-        
-        # Get local network IP
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            s.connect(('8.8.8.8', 1))
-            network_ip = s.getsockname()[0]
-        except Exception:
-            network_ip = '127.0.0.1'
-        finally:
-            s.close()
-        
-        return jsonify({
-            'local': f'http://localhost:5000',
-            'network': f'http://{network_ip}:5000',
-            'hostname': hostname,
-            'current': request.host_url
-        })
-    except Exception as e:
-        return jsonify({'error': str(e)})
-
-# ==================== OFFLINE SYNC ROUTE ====================
-@app.route('/api/offline-sync', methods=['POST'])
-def offline_sync():
-    """Sync offline alerts when client comes back online"""
-    try:
-        data = request.json
-        client_alerts = data.get('alerts', [])
-        last_sync = data.get('last_sync')
-        
-        # Process any offline alerts from client
-        for alert in client_alerts:
-            # Store or process offline alerts
-            print(f"Received offline alert: {alert}")
-        
-        # Return any missed alerts
-        missed_alerts = voice_manager.get_offline_alerts(last_sync)
-        
-        return jsonify({
-            'success': True,
-            'synced': len(client_alerts),
-            'missed_alerts': missed_alerts
-        })
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-# User Management Routes
 @app.route('/api/login', methods=['POST'])
 def login():
-    try:
-        data = request.json
-        username = data.get('username')
-        password = data.get('password')
-        user_type = data.get('user_type')
-        
-        print(f"Login attempt - Username: {username}, Type: {user_type}")
-        
-        user = User.query.filter(
-            User.username.ilike(username),
-            User.user_type == user_type
-        ).first()
-        
-        if user and user.password == password:
-            session['user_id'] = user.id
-            session['user_type'] = user.user_type
-            session['username'] = user.username
-            return jsonify({'success': True, 'user': user.to_dict()})
-        
-        return jsonify({'success': False, 'message': 'Invalid credentials'}), 401
-    except Exception as e:
-        print(f"Login error: {str(e)}")
-        return jsonify({'success': False, 'message': 'Server error'}), 500
+    data = request.json
+    user = User.query.filter_by(username=data['username'], password=data['password']).first()
+    if user:
+        session['user_id'] = user.id
+        session['username'] = user.username
+        session['role'] = user.role
+        return jsonify({'success': True, 'role': user.role})
+    return jsonify({'success': False, 'message': 'Invalid credentials'})
 
-@app.route('/api/logout', methods=['POST'])
-def logout():
-    session.clear()
-    return jsonify({'success': True})
-
-@app.route('/api/current-user', methods=['GET'])
-def get_current_user():
-    if 'user_id' in session:
-        user = db.session.get(User, session['user_id'])
-        if user:
-            return jsonify(user.to_dict())
-    return jsonify({'user': None})
-
-# Patient Routes
-@app.route('/api/my-patients', methods=['GET'])
-def get_my_patients():
+@app.route('/api/patients')
+def get_patients():
     if 'user_id' not in session:
-        return jsonify({'error': 'Not logged in'}), 401
-    
-    user = db.session.get(User, session['user_id'])
-    if not user:
-        return jsonify({'error': 'User not found'}), 404
-    
-    if user.user_type == 'nurse':
-        patients = Patient.query.all()
-        return jsonify([p.to_dict() for p in patients])
-    else:
-        patients = user.get_patients_with_details()
-        return jsonify(patients)
+        return jsonify({'error': 'Unauthorized'}), 401
+    patients = Patient.query.all()
+    return jsonify([{'id': p.id, 'name': p.name, 'age': p.age, 'room_number': p.room_number, 'disease': p.disease} for p in patients])
 
-@app.route('/api/patients/<int:patient_id>', methods=['GET'])
-def get_patient(patient_id):
-    if 'user_id' not in session:
-        return jsonify({'error': 'Not logged in'}), 401
-    
-    user = db.session.get(User, session['user_id'])
-    
-    if user.user_type == 'nurse':
-        patient = db.session.get(Patient, patient_id)
-    else:
-        patient = Patient.query.join(user_patient).filter(
-            user_patient.c.user_id == user.id,
-            Patient.id == patient_id
-        ).first()
-    
-    return jsonify(patient.to_dict() if patient else {})
-
-@app.route('/api/patients/<int:patient_id>/medicines', methods=['GET'])
+@app.route('/api/medicines/<int:patient_id>')
 def get_medicines(patient_id):
-    if 'user_id' not in session:
-        return jsonify({'error': 'Not logged in'}), 401
-    
-    medicines = Medicine.query.filter_by(patient_id=patient_id).order_by(Medicine.time).all()
-    return jsonify([m.to_dict() for m in medicines])
+    medicines = Medicine.query.filter_by(patient_id=patient_id).all()
+    return jsonify([{'id': m.id, 'name': m.name, 'dosage': m.dosage, 'time': m.time, 'status': m.status} for m in medicines])
 
-@app.route('/api/patients/<int:patient_id>/vitals', methods=['GET'])
-def get_vitals(patient_id):
-    if 'user_id' not in session:
-        return jsonify({'error': 'Not logged in'}), 401
-    
-    vitals = VitalSign.query.filter_by(patient_id=patient_id).order_by(VitalSign.recorded_at.desc()).limit(10).all()
-    return jsonify([v.to_dict() for v in vitals])
-
-@app.route('/api/medicines', methods=['POST'])
-def add_medicine():
-    if 'user_id' not in session:
-        return jsonify({'error': 'Not logged in'}), 401
-    
-    user = db.session.get(User, session['user_id'])
-    if user.user_type != 'nurse':
-        return jsonify({'error': 'Only nurses can add medicines'}), 403
-    
-    data = request.json
-    medicine = Medicine(
-        patient_id=data['patient_id'],
-        name=data['name'],
-        dosage=data['dosage'],
-        time=data['time'],
-        instructions=data.get('instructions', ''),
-        status='pending'
-    )
-    db.session.add(medicine)
-    db.session.commit()
-    socketio.emit('medicine_added', medicine.to_dict())
-    return jsonify(medicine.to_dict()), 201
-
-@app.route('/api/medicines/<int:medicine_id>/status', methods=['PUT'])
-def update_medicine_status(medicine_id):
-    if 'user_id' not in session:
-        return jsonify({'error': 'Not logged in'}), 401
-    
-    user = db.session.get(User, session['user_id'])
-    if user.user_type != 'nurse':
-        return jsonify({'error': 'Only nurses can update medicine status'}), 403
-    
-    data = request.json
-    medicine = db.session.get(Medicine, medicine_id)
-    
-    if medicine:
-        medicine.status = data['status']
-        if data['status'] == 'given':
-            medicine.last_given_time = datetime.utcnow()
-            medicine.last_given_by = user.name
-            
-            Alert.query.filter_by(medicine_id=medicine_id, status='active').update({
-                'status': 'resolved',
-                'acknowledged_at': datetime.utcnow(),
-                'acknowledged_by': user.name
-            })
-        
-        db.session.commit()
-        socketio.emit('medicine_updated', medicine.to_dict())
-        return jsonify(medicine.to_dict())
-    return jsonify({'error': 'Medicine not found'}), 404
-
-@app.route('/api/alerts', methods=['GET'])
+@app.route('/api/alerts')
 def get_alerts():
-    if 'user_id' not in session:
-        return jsonify({'error': 'Not logged in'}), 401
-    
-    user = db.session.get(User, session['user_id'])
-    
-    if user.user_type == 'nurse':
-        alerts = Alert.query.filter_by(status='active').order_by(Alert.created_at.desc()).limit(20).all()
-    else:
-        patient_ids = [row.patient_id for row in db.session.query(user_patient.c.patient_id).filter_by(user_id=user.id).all()]
-        alerts = Alert.query.filter(
-            Alert.patient_id.in_(patient_ids),
-            Alert.status == 'active'
-        ).order_by(Alert.created_at.desc()).limit(20).all()
-    
-    return jsonify([a.to_dict() for a in alerts])
+    alerts = Alert.query.filter_by(status='active').order_by(Alert.created_at.desc()).limit(20).all()
+    result = []
+    for a in alerts:
+        patient = Patient.query.get(a.patient_id)
+        result.append({'id': a.id, 'patient_name': patient.name if patient else 'Unknown', 'message': a.message, 'time': a.created_at.strftime('%H:%M:%S')})
+    return jsonify(result)
 
 @app.route('/api/alerts/<int:alert_id>/acknowledge', methods=['POST'])
 def acknowledge_alert(alert_id):
-    if 'user_id' not in session:
-        return jsonify({'error': 'Not logged in'}), 401
-    
-    user = db.session.get(User, session['user_id'])
-    alert = db.session.get(Alert, alert_id)
-    
+    alert = Alert.query.get(alert_id)
     if alert:
         alert.status = 'acknowledged'
-        alert.acknowledged_at = datetime.utcnow()
-        alert.acknowledged_by = user.name
         db.session.commit()
-        socketio.emit('alert_updated', alert.to_dict())
-        voice_manager.stop_alert()
-        return jsonify(alert.to_dict())
-    return jsonify({'error': 'Alert not found'}), 404
+        return jsonify({'success': True})
+    return jsonify({'success': False})
 
-@app.route('/api/patients/<int:patient_id>/family', methods=['GET'])
-def get_family(patient_id):
-    if 'user_id' not in session:
-        return jsonify({'error': 'Not logged in'}), 401
-    
-    family = FamilyMember.query.filter_by(patient_id=patient_id).all()
-    return jsonify([f.to_dict() for f in family])
+@app.route('/logout')
+def logout():
+    session.clear()
+    return render_template_string(LOGIN_HTML)
 
-@app.route('/api/checklist', methods=['GET'])
-def get_checklist():
-    if 'user_id' not in session:
-        return jsonify({'error': 'Not logged in'}), 401
-    
-    user = db.session.get(User, session['user_id'])
-    
-    if user.user_type == 'nurse':
-        checklist = NurseChecklist.query.filter_by(
-            nurse_name=user.name, 
-            status='pending'
-        ).all()
-        return jsonify([c.to_dict() for c in checklist])
-    
-    return jsonify({'error': 'Access denied'}), 403
+# ==================== CREATE SAMPLE DATA ====================
 
-@app.route('/api/checklist/<int:check_id>/complete', methods=['POST'])
-def complete_checklist(check_id):
-    if 'user_id' not in session:
-        return jsonify({'error': 'Not logged in'}), 401
-    
-    user = db.session.get(User, session['user_id'])
-    if user.user_type != 'nurse':
-        return jsonify({'error': 'Access denied'}), 403
-    
-    data = request.json
-    item = db.session.get(NurseChecklist, check_id)
-    if item and item.nurse_name == user.name:
-        item.status = 'completed'
-        item.completed_at = datetime.utcnow()
-        item.notes = data.get('notes', '')
-        db.session.commit()
-        socketio.emit('checklist_updated', item.to_dict())
-        return jsonify(item.to_dict())
-    return jsonify({'error': 'Checklist item not found'}), 404
+def create_sample_data():
+    with app.app_context():
+        if not User.query.filter_by(username='nurse').first():
+            nurse = User(username='nurse', password='nurse123', role='nurse', name='Head Nurse')
+            db.session.add(nurse)
+            db.session.commit()
+            
+            patient1 = Patient(name='Rajesh Kumar', age=65, room_number='101', disease='Hypertension')
+            patient2 = Patient(name='Sumanth Reddy', age=45, room_number='102', disease='Diabetes')
+            patient3 = Patient(name='Lakshmi Devi', age=58, room_number='103', disease='Blood Pressure')
+            db.session.add_all([patient1, patient2, patient3])
+            db.session.commit()
+            
+            medicine1 = Medicine(patient_id=1, name='Amlodipine', dosage='5mg', time='09:00', status='pending')
+            medicine2 = Medicine(patient_id=2, name='Metformin', dosage='500mg', time='20:00', status='pending')
+            medicine3 = Medicine(patient_id=3, name='Losartan', dosage='50mg', time='14:00', status='pending')
+            medicine4 = Medicine(patient_id=1, name='Aspirin', dosage='75mg', time='21:00', status='pending')
+            db.session.add_all([medicine1, medicine2, medicine3, medicine4])
+            db.session.commit()
+            
+            alert1 = Alert(patient_id=1, medicine_id=1, message='Medication due: Amlodipine 5mg for Rajesh Kumar')
+            alert2 = Alert(patient_id=2, medicine_id=2, message='Medication due: Metformin 500mg for Sumanth Reddy')
+            alert3 = Alert(patient_id=3, medicine_id=3, message='Medication due: Losartan 50mg for Lakshmi Devi')
+            db.session.add_all([alert1, alert2, alert3])
+            db.session.commit()
+            print("Sample data created successfully!")
 
-@app.route('/api/stats', methods=['GET'])
-def get_stats():
-    if 'user_id' not in session:
-        return jsonify({'error': 'Not logged in'}), 401
-    
-    user = db.session.get(User, session['user_id'])
-    
-    if user.user_type == 'nurse':
-        total_patients = Patient.query.count()
-        active_medicines = Medicine.query.filter_by(status='pending').count()
-        active_alerts = Alert.query.filter_by(status='active').count()
-        meds_today = Medicine.query.count()
-    else:
-        patient_ids = [row.patient_id for row in db.session.query(user_patient.c.patient_id).filter_by(user_id=user.id).all()]
-        total_patients = len(patient_ids)
-        active_medicines = Medicine.query.filter(
-            Medicine.patient_id.in_(patient_ids),
-            Medicine.status == 'pending'
-        ).count()
-        active_alerts = Alert.query.filter(
-            Alert.patient_id.in_(patient_ids),
-            Alert.status == 'active'
-        ).count()
-        meds_today = Medicine.query.filter(
-            Medicine.patient_id.in_(patient_ids)
-        ).count()
-    
-    return jsonify({
-        'total_patients': total_patients,
-        'active_medicines': active_medicines,
-        'active_alerts': active_alerts,
-        'meds_today': meds_today,
-        'user_type': user.user_type,
-        'user_name': user.name
-    })
-
-# SocketIO events
-@socketio.on('connect')
-def handle_connect():
-    print('Client connected')
-    emit('connected', {'data': 'Connected to server'})
-
-@socketio.on('disconnect')
-def handle_disconnect():
-    print('Client disconnected')
-
-@socketio.on('request_offline_alerts')
-def handle_offline_request(data):
-    """Send missed alerts to reconnecting client"""
-    last_sync = data.get('last_sync')
-    missed = voice_manager.get_offline_alerts(last_sync)
-    emit('offline_alerts', {'alerts': missed})
+# ==================== RUN APP ====================
 
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
-        init_db()
+        create_sample_data()
     
-    alert_thread = threading.Thread(target=check_medication_alerts, daemon=True)
-    alert_thread.start()
-    
-    print("=" * 50)
-    print("Starting HOSALERTS server...")
-    print("=" * 50)
-    print("📍 Local URL: http://localhost:5000")
-    
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(('8.8.8.8', 1))
-        network_ip = s.getsockname()[0]
-        s.close()
-        print(f"📍 Network URL: http://{network_ip}:5000")
-    except:
-        pass
-    
-    print("=" * 50)
-    print("✨ Features enabled:")
-    print("   ✅ Voice Alerts with Beep Sounds")
-    print("   ✅ Offline Alert Storage")
-    print("   ✅ Auto-Sync when Online")
-    print("   ✅ Vibration Support")
-    print("=" * 50)
-    print("\n🚀 For public access, run: ngrok http 5000\n")
-    
-    socketio.run(app, debug=True, port=5000)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
